@@ -6,10 +6,12 @@ Q: when we get reservation from uniswap pool, does it contains the operation in 
 if it is a view functon, no
 if it is a function execute in EVMl yes
 Q: meaning of memory    done
-Q: avoid stack too deep error
-Q: calldata
-Q: permissionedPairAddress
+Q: avoid stack too deep error    https://web.archive.org/web/20161015173410/http://james.carlyle.space/2015/07/22/solidity-stack-too-deep/
+Q: calldata   done
+Q: permissionedPairAddress    done
 
 2. with mempool
+https://www.blocknative.com/blog/mev-and-creating-a-basic-arbitrage-bot-on-ethereum-mainnet
+TODO: 
 
 3. paradigm symbolic arbitrage

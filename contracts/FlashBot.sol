@@ -1,11 +1,15 @@
 //SPDX-License-Identifier: Unlicense
 pragma solidity ^0.8.0;
 
+import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
+import '@openzeppelin/contracts/access/Ownable.sol';
 import 'hardhat/console.sol';
 
 import './interfaces/IUniswapV2Pair.sol';
 import './libraries/Decimal.sol';
+import './interfaces/IWETH.sol';
 import './libraries/SafeMath.sol';
 
 struct OrderedReserves {
@@ -15,14 +19,40 @@ struct OrderedReserves {
     uint256 b2;
 }
 
-contract FlashBot {
+struct ArbitrageInfo {
+    address baseToken;
+    address quoteToken;
+    bool baseTokenSmaller;
+    address lowerPool; // pool with lower price, denominated in quote asset
+    address higherPool; // pool with higher price, denominated in quote asset
+}
+
+struct CallbackData {
+    address debtPool;
+    address targetPool;
+    bool debtTokenSmaller;
+    address borrowedToken;
+    address debtToken;
+    uint256 debtAmount;
+    uint256 debtTokenOutAmount;
+}
+
+contract FlashBot is Ownable {
   using Decimal for Decimal.D256;
   using SafeMath for uint256;
-  // using SafeERC20 for IERC20;
+  using SafeERC20 for IERC20;
   using EnumerableSet for EnumerableSet.AddressSet;
 
   EnumerableSet.AddressSet baseTokens;
   address immutable WETH;
+
+  event Withdrawn(address indexed to, uint256 indexed value);
+  event BaseTokenAdded(address indexed token);
+  event BaseTokenRemoved(address indexed token);
+
+  // ACCESS CONTROL
+  // Only the `permissionedPairAddress` may call the `uniswapV2Call` function
+  address permissionedPairAddress = address(1);
 
   function baseTokensContains(address token) public view returns (bool) {
       return baseTokens.contains(token);
@@ -31,6 +61,55 @@ contract FlashBot {
   constructor(address _WETH) {
       WETH = _WETH;
       baseTokens.add(_WETH);
+  }
+
+  receive() external payable {}
+
+  /// @dev Redirect uniswap callback function
+  /// The callback function on different DEX are not same, so use a fallback to redirect to uniswapV2Call
+  fallback(bytes calldata _input) external returns (bytes memory) {
+      (address sender, uint256 amount0, uint256 amount1, bytes memory data) = abi.decode(_input[4:], (address, uint256, uint256, bytes));
+      uniswapV2Call(sender, amount0, amount1, data);
+  }
+
+  function withdraw() external {
+      uint256 balance = address(this).balance;
+      if (balance > 0) {
+          payable(owner()).transfer(balance);
+          emit Withdrawn(owner(), balance);
+      }
+
+      for (uint256 i = 0; i < baseTokens.length(); i++) {
+          address token = baseTokens.at(i);
+          balance = IERC20(token).balanceOf(address(this));
+          if (balance > 0) {
+              // do not use safe transfer here to prevents revert by any shitty token
+              IERC20(token).transfer(owner(), balance);
+          }
+      }
+  }
+
+  function addBaseToken(address token) external onlyOwner {
+      baseTokens.add(token);
+      emit BaseTokenAdded(token);
+  }
+
+  function removeBaseToken(address token) external onlyOwner {
+      uint256 balance = IERC20(token).balanceOf(address(this));
+      if (balance > 0) {
+          // do not use safe transfer to prevents revert by any shitty token
+          IERC20(token).transfer(owner(), balance);
+      }
+      baseTokens.remove(token);
+      emit BaseTokenRemoved(token);
+  }
+
+  function getBaseTokens() external view returns (address[] memory tokens) {
+      uint256 length = baseTokens.length();
+      tokens = new address[](length);
+      for (uint256 i = 0; i < length; i++) {
+          tokens[i] = baseTokens.at(i);
+      }
   }
 
   // is token0 base token?
@@ -172,6 +251,79 @@ contract FlashBot {
       }
   }
 
+  // do arbitrage, deposit profit in this address's balance
+  function flashArbitrage(address pool0, address pool1) external {
+    ArbitrageInfo memory info;
+    (info.baseTokenSmaller, info.baseToken, info.quoteToken) = isbaseTokenSmaller(pool0, pool1);
+    OrderedReserves memory orderedReserves;
+    (info.lowerPool, info.higherPool, orderedReserves) = getOrderedReserves(pool0, pool1, info.baseTokenSmaller);
+
+
+    // 1. borrow quote token (from higher price pool(base token price))
+    // 2. sell quote token (from lower price pool)
+    // 3. return base token (from higher price pool, remain some base token)
+
+    // this must be updated every transaction for callback origin authentication
+    permissionedPairAddress = info.lowerPool;
+
+    uint256 balanceBefore = IERC20(info.baseToken).balanceOf(address(this));
+
+    {
+      uint256 borrowAmount = calcBorrowAmount(orderedReserves);
+      (uint256 amount0Out, uint256 amount1Out) =
+          info.baseTokenSmaller ? (uint256(0), borrowAmount) : (borrowAmount, uint256(0));
+      uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
+      uint256 baseTokenOutAmount = getAmountOut(borrowAmount, orderedReserves.b2, orderedReserves.a2);
+      require(baseTokenOutAmount > debtAmount, 'Arbitrage fail, no profit');
+      console.log('Profit:', (baseTokenOutAmount - debtAmount) / 1 ether);
+
+      // can only initialize this way to avoid stack too deep error
+      CallbackData memory callbackData;
+      callbackData.debtPool = info.lowerPool;
+      callbackData.targetPool = info.higherPool;
+      callbackData.debtTokenSmaller = info.baseTokenSmaller;
+      callbackData.borrowedToken = info.quoteToken;
+      callbackData.debtToken = info.baseToken;
+      callbackData.debtAmount = debtAmount;
+      callbackData.debtTokenOutAmount = baseTokenOutAmount;
+
+      bytes memory data = abi.encode(callbackData);
+      IUniswapV2Pair(info.lowerPool).swap(amount0Out, amount1Out, address(this), data);
+    }
+
+    uint256 balanceAfter = IERC20(info.baseToken).balanceOf(address(this));
+    require(balanceAfter > balanceBefore, 'Losing money');
+
+    if (info.baseToken == WETH) {
+        IWETH(info.baseToken).withdraw(balanceAfter);
+    }
+    permissionedPairAddress = address(1);
+  }
+
+  function uniswapV2Call(
+      address sender,
+      uint256 amount0,
+      uint256 amount1,
+      bytes memory data
+  ) public {
+    require(permissionedPairAddress == msg.sender);
+    require(sender == address(this), 'Not from this contract');
+    
+    CallbackData memory info = abi.decode(data, (CallbackData));
+    // 1. sell amount1 in other pool
+    // transfer all quote token
+    IERC20(info.borrowedToken).safeTransfer(
+      info.targetPool, info.debtTokenSmaller ? amount1 : amount0);
+    (uint256 amount0out, uint256 amount1out) = 
+      info.debtTokenSmaller ? (info.debtTokenOutAmount, uint256(0)) : (uint256(0), info.debtTokenOutAmount);
+    // swap
+    IUniswapV2Pair(info.targetPool).swap(amount0out, amount1out, address(this), new bytes(0));
+    
+    // 2. transfer some base token
+    IERC20(info.debtToken).safeTransfer(
+      info.debtPool, info.debtAmount);
+  }
+
   function getAmountIn(
       uint256 amountOut,
       uint256 reserveIn,
@@ -219,6 +371,4 @@ contract FlashBot {
       }
       res = res / 10**3;
   }
-
-
 }

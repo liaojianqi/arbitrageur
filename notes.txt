@@ -1,0 +1,15 @@
+
+
+
+1. complete basic function (in github)
+Q: when we get reservation from uniswap pool, does it contains the operation in mempool?
+if it is a view functon, no
+if it is a function execute in EVMl yes
+Q: meaning of memory    done
+Q: avoid stack too deep error
+Q: calldata
+Q: permissionedPairAddress
+
+2. with mempool
+
+3. paradigm symbolic arbitrage
